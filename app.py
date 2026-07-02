@@ -510,233 +510,110 @@ def load_park_fence_data(path: Path) -> pd.DataFrame:
     return df
 
 
-def simulate_late_drop_trajectory_ft(
-    launch_speed_mph: float,
-    launch_angle_deg: float,
-    initial_lift_coef: float,
-    drag_coef: float = 0.35,
-    air_density: float = 1.225,
-    initial_height_ft: float = 3.0,
-    lift_decay_start_s: float = 1.8,
-    lift_decay_tau_s: float = 0.9,
-    dt: float = 0.003,
-    max_time: float = 12.0,
-) -> pd.DataFrame:
+def final_descent_angle_deg(launch_angle_deg: float, model_type: str | None = None) -> float:
     """
-    2D baseball trajectory with drag and time-decaying lift.
+    Empirical late-drop setting.
 
-    Goal:
-    - Early flight: enough lift/carry to look like the ball is still "riding"
-    - Late flight: lift decays, horizontal speed has dropped, so dz/dx becomes steep
-      and the ball falls more sharply.
+    This is NOT a full physics model.
+    It forces the curve to:
+    - start with the input launch angle
+    - land at the XGBoost predicted distance
+    - fall with a steeper final descent angle
 
-    This is not a full Statcast 3D trajectory.
-    It is a practical HR-detector trajectory reconstructed from EV, LA, and predicted distance.
+    This avoids the earlier -999 ft bug and captures the visual late-drop shape.
     """
-    mass = 0.145       # kg
-    radius = 0.0366    # m
-    area = np.pi * radius ** 2
-    g = 9.80665
+    la = float(launch_angle_deg)
 
-    theta = np.radians(float(launch_angle_deg))
-    v0 = float(launch_speed_mph) * 0.44704
+    if model_type == "line_drive" or la < 25:
+        # low liners usually descend less steeply than high fly balls
+        return float(np.clip(la + 22.0, 32.0, 50.0))
 
-    x = 0.0
-    z = float(initial_height_ft) * 0.3048
-    vx = v0 * np.cos(theta)
-    vz = v0 * np.sin(theta)
-
-    rows = []
-    t = 0.0
-    k = 0.5 * float(air_density) * area / mass
-
-    while t <= max_time and x >= -5 and z >= -10:
-        # Store effective lift too, so we can inspect the late-drop behavior.
-        if t <= float(lift_decay_start_s):
-            lift_eff = float(initial_lift_coef)
-        else:
-            lift_eff = float(initial_lift_coef) * np.exp(
-                -(t - float(lift_decay_start_s)) / max(float(lift_decay_tau_s), 1e-6)
-            )
-
-        rows.append((t, x * 3.28084, z * 3.28084, vx, vz, lift_eff))
-
-        v = max(np.hypot(vx, vz), 1e-9)
-
-        # Drag: opposite to velocity
-        ax_drag = -k * float(drag_coef) * v * vx
-        az_drag = -k * float(drag_coef) * v * vz
-
-        # Lift: perpendicular to velocity, upward for positive lift_eff
-        ax_lift = -k * lift_eff * v * vz
-        az_lift =  k * lift_eff * v * vx
-
-        ax = ax_drag + ax_lift
-        az = az_drag + az_lift - g
-
-        vx += ax * dt
-        vz += az * dt
-        x += vx * dt
-        z += vz * dt
-        t += dt
-
-        if t > 0.03 and z <= 0:
-            rows.append((t, x * 3.28084, z * 3.28084, vx, vz, lift_eff))
-            break
-
-    return pd.DataFrame(
-        rows,
-        columns=["time_s", "x_ft", "z_ft", "vx_mps", "vz_mps", "effective_lift_coef"],
-    )
+    # fly balls have steeper descent
+    return float(np.clip(la + 28.0, 55.0, 75.0))
 
 
-def landing_distance_from_traj(traj: pd.DataFrame) -> float:
-    if traj.empty:
-        return np.nan
-
-    z = traj["z_ft"].to_numpy()
-    x = traj["x_ft"].to_numpy()
-
-    for i in range(1, len(traj)):
-        if z[i] <= 0 <= z[i - 1]:
-            denom = z[i - 1] - z[i]
-            if abs(denom) < 1e-9:
-                return float(x[i])
-            frac = z[i - 1] / denom
-            return float(x[i - 1] + frac * (x[i] - x[i - 1]))
-
-    return float(x[-1])
-
-
-def height_at_x_from_traj(traj: pd.DataFrame, x_query_ft: float) -> float:
-    if traj.empty:
-        return np.nan
-
-    xq = float(x_query_ft)
-    x = traj["x_ft"].to_numpy()
-    z = traj["z_ft"].to_numpy()
-
-    if xq < x[0] or xq > np.nanmax(x):
-        return np.nan
-
-    return float(np.interp(xq, x, z))
-
-
-def calibrate_initial_lift_to_predicted_distance(
-    launch_speed_mph: float,
-    launch_angle_deg: float,
+def ball_height_at_distance_latedrop_ft(
     predicted_distance_ft: float,
-    drag_coef: float = 0.35,
-    air_density: float = 1.225,
+    launch_angle_deg: float,
+    fence_distance_ft: float,
     initial_height_ft: float = 3.0,
-    lift_decay_start_s: float = 1.8,
-    lift_decay_tau_s: float = 0.9,
-    lift_min: float = -0.20,
-    lift_max: float = 1.20,
-    iterations: int = 30,
-) -> tuple[float, pd.DataFrame, float, str]:
+    final_angle_deg: float | None = None,
+    model_type: str | None = None,
+) -> float:
     """
-    Calibrate the initial lift coefficient so the late-drop trajectory lands
-    near the XGBoost-predicted distance.
+    Cubic Hermite late-drop trajectory.
 
-    Difference from constant-lift model:
-    - Lift is strong early.
-    - After lift_decay_start_s, lift decays exponentially.
-    - This creates a trajectory that carries early and drops faster late.
+    Boundary conditions:
+    z(0) = initial_height_ft
+    z(R) = 0
+    dz/dx at x=0 = tan(launch_angle)
+    dz/dx at x=R = -tan(final_descent_angle)
+
+    This produces a curve that carries early and drops faster late.
     """
-    target = float(predicted_distance_ft)
+    R = float(predicted_distance_ft)
+    D = float(fence_distance_ft)
+    z0 = float(initial_height_ft)
 
-    traj_lo = simulate_late_drop_trajectory_ft(
-        launch_speed_mph, launch_angle_deg, lift_min, drag_coef, air_density,
-        initial_height_ft, lift_decay_start_s, lift_decay_tau_s
-    )
-    traj_hi = simulate_late_drop_trajectory_ft(
-        launch_speed_mph, launch_angle_deg, lift_max, drag_coef, air_density,
-        initial_height_ft, lift_decay_start_s, lift_decay_tau_s
-    )
+    if R <= 1 or D < 0:
+        return np.nan
 
-    dist_lo = landing_distance_from_traj(traj_lo)
-    dist_hi = landing_distance_from_traj(traj_hi)
+    # If the fence is beyond the predicted landing point, the ball has already landed.
+    if D > R:
+        # keep this slightly negative so clearance is naturally below the wall
+        return -1.0
 
-    if not np.isfinite(dist_lo) or not np.isfinite(dist_hi):
-        traj_mid = simulate_late_drop_trajectory_ft(
-            launch_speed_mph, launch_angle_deg, 0.25, drag_coef, air_density,
-            initial_height_ft, lift_decay_start_s, lift_decay_tau_s
-        )
-        return 0.25, traj_mid, landing_distance_from_traj(traj_mid), "fallback_default_late_drop"
+    theta0 = np.radians(float(launch_angle_deg))
+    if final_angle_deg is None:
+        final_angle_deg = final_descent_angle_deg(launch_angle_deg, model_type=model_type)
 
-    if target <= min(dist_lo, dist_hi):
-        chosen_lift = lift_min if dist_lo <= dist_hi else lift_max
-        chosen_traj = traj_lo if dist_lo <= dist_hi else traj_hi
-        return chosen_lift, chosen_traj, landing_distance_from_traj(chosen_traj), "target_below_late_drop_range"
+    theta1 = np.radians(float(final_angle_deg))
 
-    if target >= max(dist_lo, dist_hi):
-        chosen_lift = lift_max if dist_hi >= dist_lo else lift_min
-        chosen_traj = traj_hi if dist_hi >= dist_lo else traj_lo
-        return chosen_lift, chosen_traj, landing_distance_from_traj(chosen_traj), "target_above_late_drop_range"
+    # normalized distance
+    s = np.clip(D / R, 0.0, 1.0)
 
-    lo, hi = lift_min, lift_max
-    best_lift = 0.25
-    best_traj = None
-    best_dist = np.nan
-    increasing = dist_hi > dist_lo
+    # Hermite basis
+    h00 = 2 * s**3 - 3 * s**2 + 1
+    h10 = s**3 - 2 * s**2 + s
+    h01 = -2 * s**3 + 3 * s**2
+    h11 = s**3 - s**2
 
-    for _ in range(iterations):
-        mid = (lo + hi) / 2.0
-        traj_mid = simulate_late_drop_trajectory_ft(
-            launch_speed_mph, launch_angle_deg, mid, drag_coef, air_density,
-            initial_height_ft, lift_decay_start_s, lift_decay_tau_s
-        )
-        dist_mid = landing_distance_from_traj(traj_mid)
+    # derivatives w.r.t. normalized coordinate s
+    m0 = R * np.tan(theta0)
+    m1 = R * (-np.tan(theta1))
 
-        best_lift, best_traj, best_dist = mid, traj_mid, dist_mid
-
-        if increasing:
-            if dist_mid < target:
-                lo = mid
-            else:
-                hi = mid
-        else:
-            if dist_mid < target:
-                hi = mid
-            else:
-                lo = mid
-
-    return float(best_lift), best_traj, float(best_dist), "calibrated_late_drop_to_predicted_distance"
+    z = h00 * z0 + h10 * m0 + h01 * 0.0 + h11 * m1
+    return float(z)
 
 
 def judge_home_run(
     predicted_distance_ft: float,
-    launch_speed_mph: float,
     launch_angle_deg: float,
     fence_distance_ft: float,
     fence_height_ft: float,
     margin_ft: float = 2.0,
     initial_height_ft: float = 3.0,
-    drag_coef: float = 0.35,
-    air_density: float = 1.225,
-    lift_decay_start_s: float = 1.8,
-    lift_decay_tau_s: float = 0.9,
+    final_angle_deg: float | None = None,
+    model_type: str | None = None,
 ) -> dict:
     R = float(predicted_distance_ft)
     D = float(fence_distance_ft)
     H = float(fence_height_ft)
 
-    initial_lift_coef, traj, aero_landing_ft, calibration_status = calibrate_initial_lift_to_predicted_distance(
-        launch_speed_mph=launch_speed_mph,
-        launch_angle_deg=launch_angle_deg,
-        predicted_distance_ft=R,
-        drag_coef=drag_coef,
-        air_density=air_density,
-        initial_height_ft=initial_height_ft,
-        lift_decay_start_s=lift_decay_start_s,
-        lift_decay_tau_s=lift_decay_tau_s,
+    used_final_angle = (
+        final_descent_angle_deg(launch_angle_deg, model_type=model_type)
+        if final_angle_deg is None
+        else float(final_angle_deg)
     )
 
-    z_wall = height_at_x_from_traj(traj, D)
-    if not np.isfinite(z_wall):
-        z_wall = -999.0
-
+    z_wall = ball_height_at_distance_latedrop_ft(
+        predicted_distance_ft=R,
+        launch_angle_deg=launch_angle_deg,
+        fence_distance_ft=D,
+        initial_height_ft=initial_height_ft,
+        final_angle_deg=used_final_angle,
+        model_type=model_type,
+    )
     clearance = z_wall - H
 
     if R < D:
@@ -760,12 +637,8 @@ def judge_home_run(
         "ball_height_at_wall_ft": z_wall,
         "clearance_ft": clearance,
         "reason": reason,
-        "initial_lift_coef": initial_lift_coef,
-        "effective_lift_coef": initial_lift_coef,
-        "aero_landing_distance_ft": aero_landing_ft,
-        "trajectory_calibration": calibration_status,
-        "lift_decay_start_s": lift_decay_start_s,
-        "lift_decay_tau_s": lift_decay_tau_s,
+        "final_descent_angle_deg": used_final_angle,
+        "trajectory_model": "cubic_hermite_late_drop",
     }
 
 
@@ -777,11 +650,8 @@ def judge_for_park(
     launch_angle_deg: float,
     margin_ft: float,
     initial_height_ft: float,
-    launch_speed_mph: float = 100.0,
-    drag_coef: float = 0.35,
-    air_density: float = 1.225,
-    lift_decay_start_s: float = 1.8,
-    lift_decay_tau_s: float = 0.9,
+    final_angle_deg: float | None = None,
+    model_type: str | None = None,
 ) -> dict:
     zone = normalize_spray_zone5(spray_zone5)
     rows = park_df[(park_df["park"] == park) & (park_df["spray_zone5"] == zone)]
@@ -795,16 +665,13 @@ def judge_for_park(
 
     out = judge_home_run(
         predicted_distance_ft=predicted_distance_ft,
-        launch_speed_mph=launch_speed_mph,
         launch_angle_deg=launch_angle_deg,
         fence_distance_ft=fence_distance,
         fence_height_ft=fence_height,
         margin_ft=margin_ft,
         initial_height_ft=initial_height_ft,
-        drag_coef=drag_coef,
-        air_density=air_density,
-        lift_decay_start_s=lift_decay_start_s,
-        lift_decay_tau_s=lift_decay_tau_s,
+        final_angle_deg=final_angle_deg,
+        model_type=model_type,
     )
     out.update(
         {
@@ -824,11 +691,8 @@ def judge_all_parks(
     launch_angle_deg: float,
     margin_ft: float,
     initial_height_ft: float,
-    launch_speed_mph: float = 100.0,
-    drag_coef: float = 0.35,
-    air_density: float = 1.225,
-    lift_decay_start_s: float = 1.8,
-    lift_decay_tau_s: float = 0.9,
+    final_angle_deg: float | None = None,
+    model_type: str | None = None,
 ) -> pd.DataFrame:
     zone = normalize_spray_zone5(spray_zone5)
     rows = park_df[park_df["spray_zone5"] == zone].copy()
@@ -837,16 +701,13 @@ def judge_all_parks(
     for _, r in rows.iterrows():
         res = judge_home_run(
             predicted_distance_ft=predicted_distance_ft,
-            launch_speed_mph=launch_speed_mph,
             launch_angle_deg=launch_angle_deg,
             fence_distance_ft=float(r["fence_distance_ft"]),
             fence_height_ft=float(r["fence_height_ft"]),
             margin_ft=margin_ft,
             initial_height_ft=initial_height_ft,
-            drag_coef=drag_coef,
-            air_density=air_density,
-            lift_decay_start_s=lift_decay_start_s,
-            lift_decay_tau_s=lift_decay_tau_s,
+            final_angle_deg=final_angle_deg,
+            model_type=model_type,
         )
         records.append(
             {
@@ -857,9 +718,8 @@ def judge_all_parks(
                 "ball_height_at_wall_ft": res["ball_height_at_wall_ft"],
                 "clearance_ft": res["clearance_ft"],
                 "result": res["result"],
-                "initial_lift_coef": res["initial_lift_coef"],
-                "aero_landing_distance_ft": res["aero_landing_distance_ft"],
-                "trajectory_calibration": res["trajectory_calibration"],
+                "final_descent_angle_deg": res["final_descent_angle_deg"],
+                "trajectory_model": res["trajectory_model"],
                 "reason": res["reason"],
             }
         )
@@ -1008,43 +868,25 @@ with left:
             max_value=6.0,
             value=3.0,
             step=0.5,
-            help="타격 순간 공의 높이입니다. 공기역학 궤적 복원용 값입니다.",
+            help="타격 순간 공의 높이입니다. late-drop 궤적 복원용 값입니다.",
         )
 
-    with st.expander("공기역학 설정"):
-        drag_coef = st.slider(
-            "Drag coefficient Cd",
-            min_value=0.25,
-            max_value=0.50,
-            value=0.35,
-            step=0.01,
-            help="공기저항 계수입니다. 값이 클수록 공이 더 빨리 감속합니다.",
+    with st.expander("Late-drop 궤적 설정"):
+        manual_final_angle = st.checkbox("최종 낙하각 직접 지정", value=False)
+        final_angle_deg_input = None
+        if manual_final_angle:
+            final_angle_deg_input = st.slider(
+                "Final descent angle (deg)",
+                min_value=25.0,
+                max_value=80.0,
+                value=55.0,
+                step=1.0,
+                help="착지 직전 타구가 아래로 떨어지는 각도입니다. 클수록 후반에 급격히 떨어집니다.",
+            )
+        st.caption(
+            "기본값은 발사각과 line_drive/fly_ball 구분으로 자동 설정합니다. "
+            "이 궤적은 실제 3D 물리식이 아니라, 예측 비거리에 맞춘 late-drop 형상 모델입니다."
         )
-        air_density = st.slider(
-            "Air density rho (kg/m³)",
-            min_value=0.90,
-            max_value=1.30,
-            value=1.225,
-            step=0.005,
-            help="공기 밀도입니다. 고지대/더운 날씨는 더 낮은 값을 쓸 수 있습니다.",
-        )
-        lift_decay_start_s = st.slider(
-            "Late-drop start time (s)",
-            min_value=0.8,
-            max_value=3.5,
-            value=1.8,
-            step=0.1,
-            help="이 시간 이후부터 lift를 감소시켜 후반부 낙하를 더 강하게 만듭니다.",
-        )
-        lift_decay_tau_s = st.slider(
-            "Late-drop decay tau (s)",
-            min_value=0.3,
-            max_value=2.5,
-            value=0.9,
-            step=0.1,
-            help="값이 작을수록 lift가 더 빨리 줄어들어 후반부에 더 급격히 떨어집니다.",
-        )
-        st.caption("초기 lift는 XGBoost 예측 비거리에 맞도록 자동 보정하고, 비행 후반에는 lift를 감소시켜 late-drop을 반영합니다.")
 
     predict_clicked = st.button("예측 실행", type="primary", use_container_width=True)
 
@@ -1126,11 +968,8 @@ if predict_clicked:
             launch_angle_deg=float(la),
             margin_ft=float(margin_ft),
             initial_height_ft=float(initial_height_ft),
-            launch_speed_mph=float(ev),
-            drag_coef=float(drag_coef),
-            air_density=float(air_density),
-            lift_decay_start_s=float(lift_decay_start_s),
-            lift_decay_tau_s=float(lift_decay_tau_s),
+            final_angle_deg=final_angle_deg_input,
+            model_type=str(row["model_type"]),
         )
     except Exception as exc:
         st.error("홈런 판독에 실패했습니다.")
@@ -1176,11 +1015,8 @@ if predict_clicked:
             ["Fence height", f"{float(hr_result['fence_height_ft']):.1f} ft"],
             ["Ball height at fence", f"{float(hr_result['ball_height_at_wall_ft']):.1f} ft"],
             ["Clearance", f"{float(hr_result['clearance_ft']):.1f} ft"],
-            ["Initial lift coefficient", f"{float(hr_result['initial_lift_coef']):.3f}"],
-            ["Late-drop start", f"{float(hr_result['lift_decay_start_s']):.1f} s"],
-            ["Late-drop tau", f"{float(hr_result['lift_decay_tau_s']):.1f} s"],
-            ["Aero landing distance", f"{float(hr_result['aero_landing_distance_ft']):.1f} ft"],
-            ["Trajectory calibration", str(hr_result["trajectory_calibration"])],
+            ["Final descent angle", f"{float(hr_result['final_descent_angle_deg']):.1f}°"],
+            ["Trajectory model", str(hr_result["trajectory_model"])],
             ["HR 판정", hr_result["result"]],
         ],
         columns=["항목", "값"],
@@ -1198,11 +1034,8 @@ if predict_clicked:
             launch_angle_deg=float(la),
             margin_ft=float(margin_ft),
             initial_height_ft=float(initial_height_ft),
-            launch_speed_mph=float(ev),
-            drag_coef=float(drag_coef),
-            air_density=float(air_density),
-            lift_decay_start_s=float(lift_decay_start_s),
-            lift_decay_tau_s=float(lift_decay_tau_s),
+            final_angle_deg=final_angle_deg_input,
+            model_type=str(row["model_type"]),
         )
 
         hr_count = int(all_results["result"].isin(["HOME_RUN", "BORDERLINE_HR"]).sum())
@@ -1216,18 +1049,16 @@ if predict_clicked:
             "fence_height_ft",
             "ball_height_at_wall_ft",
             "clearance_ft",
-            "initial_lift_coef",
-            "trajectory_calibration",
+            "final_descent_angle_deg",
             "reason",
         ]
         display_df = all_results[show_cols].copy()
-        for c in ["fence_distance_ft", "fence_height_ft", "ball_height_at_wall_ft", "clearance_ft"]:
-            display_df[c] = display_df[c].map(lambda x: f"{x:.1f}")
-        if "initial_lift_coef" in display_df.columns:
-            display_df["initial_lift_coef"] = display_df["initial_lift_coef"].map(lambda x: f"{x:.3f}")
+        for c in ["fence_distance_ft", "fence_height_ft", "ball_height_at_wall_ft", "clearance_ft", "final_descent_angle_deg"]:
+            if c in display_df.columns:
+                display_df[c] = display_df[c].map(lambda x: f"{x:.1f}")
         st.dataframe(display_df, hide_index=True, use_container_width=True)
 
     st.caption(
-        "홈런 판정은 XGBoost 예측 비거리에 맞도록 초기 lift를 보정하고, "
-        "비행 후반 lift를 감소시키는 late-drop 궤적으로 펜스 위치의 공 높이를 계산하는 후처리 모듈입니다."
+        "홈런 판정은 예측 비거리를 기준으로 초반 carry와 후반 급락을 반영한 late-drop 궤적을 복원한 뒤, "
+        "선택 구장/방향의 펜스 위치에서 공 높이가 담장 높이를 넘는지 확인하는 후처리 모듈입니다."
     )
